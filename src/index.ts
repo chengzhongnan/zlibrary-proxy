@@ -1,40 +1,44 @@
-import express from 'express'
-import path from 'path'
-import { fileURLToPath } from 'url'
-// Node 18+ 原生支持 fetch，如果 Vercel 环境较老可能需要安装 node-fetch，
-// 但现在 Vercel 默认环境通常都支持。
+import express, { Request, Response } from 'express'; // 需要安装 @types/express
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-const app = express()
+// 确保 TS 识别 fetch (Node 18+ 内置)
+// 如果报错找不到 fetch，请在 tsconfig.json 中添加 "lib": ["DOM", "ES2020"]
+declare const fetch: any; 
+declare const Headers: any;
+declare const Request: any;
 
-// 禁用 Express 默认的 Body 解析，以便直接转发原始 Body
-// 如果你需要处理 POST 请求的 Body，这一点很重要
+const app = express();
+
+// 禁用 Express 默认的 Body 解析
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
-// 核心代理逻辑：捕获所有方法和所有路径
-app.all('*', async (req, res) => {
+app.all('*', async (req: Request, res: Response) => {
   try {
     // === 动态获取当前代理的域名和Origin ===
-    const currentHost = req.headers.host; // 例如: your-project.vercel.app
+    const currentHost = req.headers.host || 'localhost';
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const currentOrigin = `${protocol}://${currentHost}`; 
 
     // === 目标配置 ===
-    // 在 Vercel 后台配置环境变量 ZLIBRARY_DOMAIN，或者使用默认值
     const realZlibraryUrl = process.env.ZLIBRARY_DOMAIN || 'z-library.sk';
     
     // 构建目标 URL
-    // req.url 包含了路径和查询参数 (e.g. /s/book?q=test)
     const targetUrlString = `https://${realZlibraryUrl}${req.url}`;
     const targetUrl = new URL(targetUrlString);
 
     // === 处理请求头 ===
     const headers = new Headers();
     
-    // 复制原始请求头
+    // 修复 TS2345 错误的部分
     Object.keys(req.headers).forEach(key => {
-      // 排除 Node/Express 特有或需要剔除的头
       if (['host', 'connection', 'content-length'].includes(key)) return;
-      headers.set(key, req.headers[key]);
+      
+      const value = req.headers[key];
+      if (value) {
+        // 如果是数组则 join，否则直接用
+        headers.set(key, Array.isArray(value) ? value.join(', ') : value);
+      }
     });
 
     // 伪装成 Chrome
@@ -47,9 +51,6 @@ app.all('*', async (req, res) => {
     headers.delete("X-Real-IP");
 
     // === 修改请求 Cookie ===
-    // 注意：浏览器发送到服务器的 Cookie 只有 key=value，通常不包含 Domain 属性。
-    // 这里主要做简单的透传，原有的 Domain 替换逻辑在 Request 阶段其实很少生效，
-    // 但为了保持逻辑一致，我们保留替换尝试。
     const cookieHeader = req.headers['cookie'];
     if (cookieHeader) {
       const modifiedCookies = cookieHeader.split(";").map((cookie) => {
@@ -59,14 +60,13 @@ app.all('*', async (req, res) => {
     }
 
     // === 发起请求 ===
-    // 如果是 GET/HEAD 请求，body 必须为 null
     const requestBody = ['GET', 'HEAD'].includes(req.method) ? null : req.body;
 
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
       body: requestBody,
-      redirect: "manual" // 禁止自动跟随重定向，以便我们处理 Location
+      redirect: "manual"
     });
 
     // === 处理响应头 ===
@@ -77,7 +77,6 @@ app.all('*', async (req, res) => {
       let location = newResponseHeaders.get("location");
       if (location && location.includes(realZlibraryUrl)) {
         location = location.replace(realZlibraryUrl, currentHost);
-        // 如果 location 是绝对路径但协议是 https，可能需要确保指向当前协议
         location = location.replace(`https://${currentHost}`, currentOrigin);
         res.setHeader("location", location);
       } else if (location) {
@@ -85,72 +84,67 @@ app.all('*', async (req, res) => {
       }
     }
 
-    // 2. 处理 Set-Cookie
-    // Node fetch API 获取 Set-Cookie 有时需要用 getSetCookie() (Node 18+)
-    const setCookies = typeof response.headers.getSetCookie === 'function' 
-        ? response.headers.getSetCookie() 
-        : (response.headers.get('set-cookie') ? [response.headers.get('set-cookie')] : []);
+    // 2. 处理 Set-Cookie (兼容性处理)
+    // TypeScript 可能报错 getSetCookie 不存在，因此我们用类型断言或 fallback
+    let setCookies: string[] = [];
+    if (typeof (response.headers as any).getSetCookie === 'function') {
+        setCookies = (response.headers as any).getSetCookie();
+    } else {
+        const sc = response.headers.get('set-cookie');
+        if (sc) setCookies = [sc];
+    }
 
     if (setCookies.length > 0) {
       const reg = new RegExp(realZlibraryUrl, "ig");
       const updatedCookies = setCookies.map(cookie => {
-        // 替换 Domain
         return cookie.replace(reg, currentHost);
       });
-      // Express 使用 res.append 设置多个同名 Header
       updatedCookies.forEach(c => res.append('set-cookie', c));
     }
 
     // 复制其他普通响应头
-    response.headers.forEach((value, key) => {
+    (response.headers as any).forEach((value: string, key: string) => {
       if (['content-encoding', 'content-length', 'transfer-encoding', 'location', 'set-cookie'].includes(key)) return;
       res.setHeader(key, value);
     });
 
-    // === 设置状态码 ===
     res.status(response.status);
 
-    // 如果是 302 重定向，直接结束
     if (response.status === 302) {
-      return res.end();
+      res.end();
+      return;
     }
 
     // === 处理响应体 ===
-    // 静态资源直接透传
     const filterUrls = [".woff", ".woff2", ".ttf", ".jpg", ".png", ".svg", ".ico", ".css", ".js"];
     const isStatic = filterUrls.some(ext => req.path.endsWith(ext));
 
     if (isStatic) {
-      // 将 ArrayBuffer 转换为 Buffer 发送
       const arrayBuffer = await response.arrayBuffer();
-      return res.send(Buffer.from(arrayBuffer));
+      res.send(Buffer.from(arrayBuffer));
+      return;
     }
 
-    // 文本/HTML 替换逻辑
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('text') || contentType.includes('json') || contentType.includes('xml')) {
         let responseBody = await response.text();
-        
         responseBody = responseBody
-            // 替换带协议的完整 URL
             .replace(
             new RegExp(`https:((//)|(\\/\\/))([a-zA-Z0-9-]+\\.)?${realZlibraryUrl.replaceAll(".", "\\.")}`, "ig"),
             currentOrigin
             )
-            // 替换纯文本域名
             .replace(new RegExp(realZlibraryUrl, "ig"), currentHost);
 
-        return res.send(responseBody);
+        res.send(responseBody);
     } else {
-        // 其他类型二进制文件 (如 pdf, epub 下载)
         const arrayBuffer = await response.arrayBuffer();
-        return res.send(Buffer.from(arrayBuffer));
+        res.send(Buffer.from(arrayBuffer));
     }
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("Proxy Error:", error);
     res.status(500).send("Proxy Error: " + error.message);
   }
 });
 
-export default app
+export default app;
