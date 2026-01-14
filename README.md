@@ -15,7 +15,7 @@ Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_mediu
 ### Clone and Deploy
 
 ```bash
-git clone https://github.com/vercel/examples/tree/main/solutions/express
+git clone https://github.com/chengzhongnan/zlibrary-proxy.git
 ```
 
 Install the Vercel CLI:
